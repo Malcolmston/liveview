@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"html"
 	"net/http"
 	"sync"
 )
@@ -115,7 +114,7 @@ func (h *Handler) servePage(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	page := "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>liveview</title></head><body>\n" +
-		"<div id=\"lv-root\" data-session=\"" + html.EscapeString(sess.id) + "\">" +
+		"<div id=\"lv-root\" data-session=\"" + htmlEscape(sess.id) + "\">" +
 		rendered.HTML() +
 		"</div>\n<script>" + clientJS(h.prefix) + "</script>\n</body></html>\n"
 	_, _ = w.Write([]byte(page))

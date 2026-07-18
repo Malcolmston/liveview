@@ -1,0 +1,10 @@
+{
+  "repo": "liveview",
+  "upstream": "phoenixframework/phoenix_live_view",
+  "parityBefore": "90%",
+  "parityAfter": "100%",
+  "upstreamCasesSynced": 18,
+  "gapsFound": 2,
+  "gapsClosed": 2,
+  "asOf": "2026-07-18"
+}

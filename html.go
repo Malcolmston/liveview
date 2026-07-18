@@ -1,7 +1,6 @@
 package liveview
 
 import (
-	"html"
 	"sort"
 	"strings"
 )
@@ -41,13 +40,13 @@ func AttrList(attrs map[string]any) Safe {
 		case bool:
 			if v {
 				b.WriteByte(' ')
-				b.WriteString(html.EscapeString(name))
+				b.WriteString(htmlEscape(name))
 			}
 		default:
 			b.WriteByte(' ')
-			b.WriteString(html.EscapeString(name))
+			b.WriteString(htmlEscape(name))
 			b.WriteString(`="`)
-			b.WriteString(html.EscapeString(toString(v)))
+			b.WriteString(htmlEscape(toString(v)))
 			b.WriteByte('"')
 		}
 	}
@@ -67,9 +66,9 @@ func HiddenInputs(fields map[string]string) Safe {
 	var b strings.Builder
 	for _, name := range names {
 		b.WriteString(`<input type="hidden" name="`)
-		b.WriteString(html.EscapeString(name))
+		b.WriteString(htmlEscape(name))
 		b.WriteString(`" value="`)
-		b.WriteString(html.EscapeString(fields[name]))
+		b.WriteString(htmlEscape(fields[name]))
 		b.WriteString(`">`)
 	}
 	return Safe(b.String())
@@ -95,11 +94,11 @@ func LiveNavigate(text, href string) Safe {
 func liveLink(text, href, kind string) Safe {
 	var b strings.Builder
 	b.WriteString(`<a href="`)
-	b.WriteString(html.EscapeString(href))
+	b.WriteString(htmlEscape(href))
 	b.WriteString(`" data-phx-link="`)
 	b.WriteString(kind)
 	b.WriteString(`" data-phx-link-state="push">`)
-	b.WriteString(html.EscapeString(text))
+	b.WriteString(htmlEscape(text))
 	b.WriteString(`</a>`)
 	return Safe(b.String())
 }

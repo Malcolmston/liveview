@@ -32,7 +32,7 @@ func TestAttrList(t *testing.T) {
 		{"sorted values", map[string]any{"id": "x", "class": "c"}, ` class="c" id="x"`},
 		{"bool true", map[string]any{"disabled": true}, ` disabled`},
 		{"bool false omitted", map[string]any{"disabled": false, "id": "x"}, ` id="x"`},
-		{"escaped value", map[string]any{"title": `a"b`}, ` title="a&#34;b"`},
+		{"escaped value", map[string]any{"title": `a"b`}, ` title="a&quot;b"`},
 		{"int value", map[string]any{"tabindex": 2}, ` tabindex="2"`},
 	}
 	for _, tc := range tests {
@@ -54,7 +54,7 @@ func TestHiddenInputs(t *testing.T) {
 		t.Error("empty HiddenInputs should be empty")
 	}
 	esc := string(HiddenInputs(map[string]string{"x": `"><script>`}))
-	want2 := `<input type="hidden" name="x" value="&#34;&gt;&lt;script&gt;">`
+	want2 := `<input type="hidden" name="x" value="&quot;&gt;&lt;script&gt;">`
 	if esc != want2 {
 		t.Errorf("HiddenInputs escaping\n got %s\nwant %s", esc, want2)
 	}
@@ -69,7 +69,7 @@ func TestLiveLinks(t *testing.T) {
 	}
 	// Escaping of href and text.
 	got := string(LivePatch(`<b>`, `/a?x="1"&y=2`))
-	want := `<a href="/a?x=&#34;1&#34;&amp;y=2" data-phx-link="patch" data-phx-link-state="push">&lt;b&gt;</a>`
+	want := `<a href="/a?x=&quot;1&quot;&amp;y=2" data-phx-link="patch" data-phx-link-state="push">&lt;b&gt;</a>`
 	if got != want {
 		t.Errorf("LivePatch escaping\n got %s\nwant %s", got, want)
 	}

@@ -1,7 +1,6 @@
 package liveview
 
 import (
-	"html"
 	"strings"
 )
 
@@ -77,8 +76,47 @@ func escape(v any) any {
 	case Safe:
 		return string(t)
 	case string:
-		return html.EscapeString(t)
+		return htmlEscape(t)
 	default:
-		return html.EscapeString(toString(t))
+		return htmlEscape(toString(t))
 	}
+}
+
+// htmlEscape escapes the five HTML metacharacters exactly as Phoenix
+// LiveView's HTML engine does, so escaped output is byte-for-byte identical to
+// the upstream library:
+//
+//	&  ->  &amp;
+//	<  ->  &lt;
+//	>  ->  &gt;
+//	"  ->  &quot;
+//	'  ->  &#39;
+//
+// The standard library's html.EscapeString diverges on the double quote alone,
+// emitting &#34; where Phoenix emits &quot;. Because rendered dynamics travel on
+// the wire verbatim, matching Phoenix's entity keeps the Go port's diffs
+// identical to upstream's. It allocates only when a metacharacter is present.
+func htmlEscape(s string) string {
+	if strings.IndexAny(s, `&<>"'`) < 0 {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '&':
+			b.WriteString("&amp;")
+		case '<':
+			b.WriteString("&lt;")
+		case '>':
+			b.WriteString("&gt;")
+		case '"':
+			b.WriteString("&quot;")
+		case '\'':
+			b.WriteString("&#39;")
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
 }

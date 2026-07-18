@@ -35,7 +35,7 @@ func TestTemplateEscaping(t *testing.T) {
 	if strings.Contains(got, "<script>") {
 		t.Fatalf("unescaped output: %q", got)
 	}
-	want := "<p>&lt;script&gt;&#34;x&#34;&amp;y&lt;/script&gt;</p>"
+	want := "<p>&lt;script&gt;&quot;x&quot;&amp;y&lt;/script&gt;</p>"
 	if got != want {
 		t.Fatalf("html = %q, want %q", got, want)
 	}
