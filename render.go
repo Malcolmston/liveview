@@ -57,6 +57,10 @@ func (r *Rendered) writeHTML(b *strings.Builder) {
 				b.WriteString(d)
 			case *Rendered:
 				d.writeHTML(b)
+			case *componentRef:
+				if d.state.current != nil {
+					d.state.current.writeHTML(b)
+				}
 			}
 		}
 	}
@@ -67,6 +71,8 @@ func (r *Rendered) writeHTML(b *strings.Builder) {
 func escape(v any) any {
 	switch t := v.(type) {
 	case *Rendered:
+		return t
+	case *componentRef:
 		return t
 	case Safe:
 		return string(t)

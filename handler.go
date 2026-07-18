@@ -2,6 +2,7 @@ package liveview
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"html"
@@ -9,20 +10,26 @@ import (
 	"sync"
 )
 
-// Handler is an [http.Handler] that serves a live view over plain HTTP + JSON.
-// It has two routes relative to its mount path:
+// Handler is an [http.Handler] that serves a live view over HTTP plus a
+// self-implemented RFC 6455 WebSocket. It has these behaviours on its mount
+// path:
 //
-//   - GET  {prefix}/         serves the full initial HTML page (a new session is
-//     mounted per request and its id is embedded in the page).
-//   - POST {prefix}/event    accepts {"session","event","payload"} JSON, runs
-//     the event on the named session, and replies with the [Diff] as JSON.
+//   - GET (no upgrade)  serves the full initial HTML page: a fresh session is
+//     mounted, its rendered HTML is embedded, and the served JS client is
+//     inlined.
+//   - GET (websocket)   upgrades to a WebSocket, mounts a session, ships the
+//     initial full diff, then streams events in and diffs out.
+//   - POST {prefix}/event  the legacy JSON event route ({"session","event",
+//     "payload"} in, [Diff] out), kept for non-socket drivers and tests.
 //
-// Sessions are held in memory. This is a reference transport; a production
-// deployment would layer authentication, session eviction, and a websocket on
-// top, but the state -> render -> diff core is identical.
+// Sessions are held in memory and share one [PubSub] hub, so views can
+// Subscribe/Broadcast across connections. This is a reference transport; a
+// production deployment would add authentication and session eviction, but the
+// state -> render -> diff core is identical.
 type Handler struct {
 	newView func() View
 	prefix  string
+	pubsub  *PubSub
 
 	mu       sync.Mutex
 	sessions map[string]*Session
@@ -30,7 +37,7 @@ type Handler struct {
 
 // NewHandler returns a Handler that builds a fresh View (via factory) for each
 // mounted session. prefix is the URL path the handler is served under and is
-// used to construct the client event URL; "" is treated as "/".
+// used to construct the client WebSocket URL; "" is treated as "/".
 func NewHandler(prefix string, factory func() View) *Handler {
 	if prefix == "" {
 		prefix = "/"
@@ -38,9 +45,14 @@ func NewHandler(prefix string, factory func() View) *Handler {
 	return &Handler{
 		newView:  factory,
 		prefix:   prefix,
+		pubsub:   NewPubSub(),
 		sessions: make(map[string]*Session),
 	}
 }
+
+// PubSub returns the hub shared by every session this handler mounts, so
+// application code outside a request can broadcast to connected views.
+func (h *Handler) PubSub() *PubSub { return h.pubsub }
 
 // Session returns a live session by id, or nil.
 func (h *Handler) Session(id string) *Session {
@@ -55,19 +67,31 @@ func (h *Handler) put(s *Session) {
 	h.mu.Unlock()
 }
 
+func (h *Handler) drop(id string) {
+	h.mu.Lock()
+	delete(h.sessions, id)
+	h.mu.Unlock()
+}
+
 // ServeHTTP implements http.Handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodPost:
+	switch {
+	case isWebSocketUpgrade(r):
+		h.serveWS(w, r)
+	case r.Method == http.MethodPost:
 		h.serveEvent(w, r)
 	default:
 		h.servePage(w, r)
 	}
 }
 
-func (h *Handler) servePage(w http.ResponseWriter, r *http.Request) {
+// newSession builds, mounts, and returns a fresh session for a request, wiring
+// in the shared PubSub and recording the request URI.
+func (h *Handler) newSession(r *http.Request) (*Session, *Rendered, error) {
 	sess := NewSession(h.newView())
 	sess.id = newID()
+	sess.AttachPubSub(h.pubsub)
+	sess.SetURI(r.URL.RequestURI())
 	params := map[string]any{}
 	for k, vs := range r.URL.Query() {
 		if len(vs) > 0 {
@@ -75,6 +99,14 @@ func (h *Handler) servePage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	rendered, err := sess.Mount(params)
+	if err != nil {
+		return nil, nil, err
+	}
+	return sess, rendered, nil
+}
+
+func (h *Handler) servePage(w http.ResponseWriter, r *http.Request) {
+	sess, rendered, err := h.newSession(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -89,7 +121,138 @@ func (h *Handler) servePage(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(page))
 }
 
-// eventRequest is the JSON body accepted by the event route.
+// serveWS upgrades the request to a WebSocket, mounts a session, and runs the
+// event/diff loop until the client disconnects.
+func (h *Handler) serveWS(w http.ResponseWriter, r *http.Request) {
+	sess, _, err := h.newSession(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	conn, err := Upgrade(w, r)
+	if err != nil {
+		return
+	}
+	sess.SetConnected(true)
+	h.put(sess)
+	h.socketLoop(conn, sess)
+}
+
+// socketLoop drives one WebSocket session: it ships the initial diff, then
+// multiplexes inbound client messages and outbound server-push messages,
+// serializing all writes on this goroutine.
+func (h *Handler) socketLoop(conn *Conn, sess *Session) {
+	defer func() {
+		sess.Close()
+		h.drop(sess.id)
+		_ = conn.Close()
+	}()
+
+	_ = writeReply(conn, "mount", sess.InitialDiff())
+
+	type inbound struct {
+		data []byte
+		err  error
+	}
+	reads := make(chan inbound, 1)
+	go func() {
+		for {
+			_, data, err := conn.ReadMessage()
+			reads <- inbound{data: data, err: err}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case in := <-reads:
+			if in.err != nil {
+				return
+			}
+			if diff, ok := h.dispatch(sess, in.data); ok {
+				_ = writeReply(conn, "diff", diff)
+			}
+		case msg := <-sess.Inbox():
+			if diff, err := sess.Info(msg); err == nil {
+				_ = writeReply(conn, "diff", diff)
+			}
+		}
+	}
+}
+
+// clientMessage is the JSON envelope the browser client sends over the socket.
+type clientMessage struct {
+	Type     string         `json:"type"`
+	Event    string         `json:"event"`
+	CID      *int           `json:"cid"`
+	Payload  map[string]any `json:"payload"`
+	URI      string         `json:"uri"`
+	Name     string         `json:"name"`
+	Ref      string         `json:"ref"`
+	FileName string         `json:"file_name"`
+	Size     int64          `json:"size"`
+	MIME     string         `json:"mime"`
+	Data     string         `json:"data"`
+	Last     bool           `json:"last"`
+}
+
+// dispatch decodes and routes one client message, returning the diff to send
+// back and whether a reply should be written.
+func (h *Handler) dispatch(sess *Session, data []byte) (Diff, bool) {
+	var m clientMessage
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, false
+	}
+	switch m.Type {
+	case "event":
+		var diff Diff
+		var err error
+		if m.CID != nil {
+			diff, err = sess.ComponentEvent(*m.CID, m.Event, m.Payload)
+		} else {
+			diff, err = sess.Event(m.Event, m.Payload)
+		}
+		if err != nil {
+			return nil, false
+		}
+		return diff, true
+	case "patch":
+		diff, err := sess.Params(nil, m.URI)
+		if err != nil {
+			return nil, false
+		}
+		return diff, true
+	case "upload_start":
+		if err := sess.RegisterUploadEntry(m.Name, m.Ref, m.FileName, m.Size, m.MIME); err != nil {
+			return nil, false
+		}
+		return Diff{}, true
+	case "upload_chunk":
+		raw, err := base64.StdEncoding.DecodeString(m.Data)
+		if err != nil {
+			return nil, false
+		}
+		diff, err := sess.UploadChunk(m.Name, m.Ref, raw, m.Last)
+		if err != nil {
+			return nil, false
+		}
+		return diff, true
+	}
+	return nil, false
+}
+
+// writeReply marshals {"type":typ,"diff":diff} and writes it as a text frame.
+func writeReply(conn *Conn, typ string, diff Diff) error {
+	b, err := json.Marshal(map[string]any{"type": typ, "diff": diff})
+	if err != nil {
+		return err
+	}
+	return conn.WriteText(string(b))
+}
+
+// eventRequest is the JSON body accepted by the legacy event route.
 type eventRequest struct {
 	Session string         `json:"session"`
 	Event   string         `json:"event"`
@@ -124,29 +287,4 @@ func newID() string {
 		return "session-fallback"
 	}
 	return hex.EncodeToString(b[:])
-}
-
-// clientJS is a tiny illustrative browser stub: elements carrying a
-// data-lv-click attribute send that event name to the server and log the diff.
-// It is intentionally minimal — enough to demonstrate the wire protocol without
-// pulling in a build step.
-func clientJS(prefix string) string {
-	url := prefix
-	if url == "/" {
-		url = ""
-	}
-	return `
-(function(){
-  var root=document.getElementById('lv-root');
-  var session=root.getAttribute('data-session');
-  function send(event,payload){
-    fetch('` + url + `/event',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({session:session,event:event,payload:payload||{}})})
-      .then(function(r){return r.json();}).then(function(diff){console.log('diff',diff);});
-  }
-  document.addEventListener('click',function(e){
-    var t=e.target.closest('[data-lv-click]');
-    if(t){send(t.getAttribute('data-lv-click'),{});}
-  });
-})();`
 }

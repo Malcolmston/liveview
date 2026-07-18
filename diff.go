@@ -9,17 +9,24 @@ package liveview
 // Value shapes inside a Diff:
 //
 //   - string        a changed leaf slot; the new escaped HTML for that slot.
-//   - Diff          a changed nested component; the recursive sub-diff.
+//   - Diff          a changed nested [Rendered]; the recursive sub-diff.
+//   - int           a component reference; the value is the component's cid and
+//     its own diff lives under the top-level "c" key keyed by that cid.
 //   - the "s" key   present only on a full/initial diff, holding []string
 //     statics so a fresh client can build the document from scratch.
+//   - the "c" key   present when the render embeds stateful components, holding
+//     a map[string]Diff of per-cid component diffs.
 //
 // A Diff marshals to JSON as, for example, {"0":"1","2":{"1":"x"}} — the same
 // wire shape LiveView uses. An empty Diff means nothing changed.
 type Diff map[string]any
 
 // staticsKey is the reserved slot name carrying the static fragments in a full
-// diff.
-const staticsKey = "s"
+// diff. componentsKey carries per-cid component diffs (attached by the runtime).
+const (
+	staticsKey    = "s"
+	componentsKey = "c"
+)
 
 // Empty reports whether the diff carries no changes.
 func (d Diff) Empty() bool {
@@ -28,7 +35,8 @@ func (d Diff) Empty() bool {
 
 // FullDiff produces the complete patch for an initial render: every dynamic slot
 // plus the statics under the "s" key. Sending this to a fresh client lets it
-// reconstruct the entire document.
+// reconstruct the entire document. A component reference contributes only its
+// cid at the slot; the component's own diff is shipped separately under "c".
 func FullDiff(r *Rendered) Diff {
 	d := Diff{}
 	if r == nil {
@@ -41,6 +49,8 @@ func FullDiff(r *Rendered) Diff {
 			d[itoa(i)] = v
 		case *Rendered:
 			d[itoa(i)] = FullDiff(v)
+		case *componentRef:
+			d[itoa(i)] = v.cid
 		}
 	}
 	return d
@@ -77,6 +87,14 @@ func DiffRendered(prev, next *Rendered) Diff {
 			sub := DiffRendered(pr, nv)
 			if !sub.Empty() {
 				d[itoa(i)] = sub
+			}
+		case *componentRef:
+			// A component slot carries only its stable cid. When the cid is
+			// unchanged the slot is omitted entirely (the client keeps the
+			// reference) and the component's own delta travels under "c",
+			// produced by the ComponentManager. A changed cid re-emits it.
+			if pr, ok := pd.(*componentRef); !ok || pr.cid != nv.cid {
+				d[itoa(i)] = nv.cid
 			}
 		}
 	}

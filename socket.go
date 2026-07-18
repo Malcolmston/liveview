@@ -12,13 +12,30 @@ package liveview
 type Socket struct {
 	assigns map[string]any
 	changed map[string]bool
+
+	// Runtime side-channels populated during Mount/HandleEvent/HandleInfo and
+	// drained by the owning Session. They are nil on a bare socket created with
+	// NewSocket and wired up by NewSession.
+	inbox     chan any                 // server-push mailbox (handle_info / pubsub)
+	pubsub    *PubSub                  // hub for Subscribe; may be nil
+	comps     *ComponentManager        // stateful component registry; may be nil
+	nav       *Nav                     // pending push_patch / push_navigate
+	events    []PushEvent              // pending push_event to the client
+	uploads   map[string]*UploadConfig // declared upload slots
+	streams   map[string]*Stream       // declared streams
+	topics    []string                 // topics subscribed on this socket
+	connected bool                     // true once a live (websocket) transport is attached
 }
 
-// NewSocket returns an empty Socket ready to receive assigns.
+// NewSocket returns an empty Socket ready to receive assigns. The runtime
+// side-channels (inbox, pubsub, components) are left nil; [NewSession] wires
+// them up for a live connection.
 func NewSocket() *Socket {
 	return &Socket{
 		assigns: make(map[string]any),
 		changed: make(map[string]bool),
+		uploads: make(map[string]*UploadConfig),
+		streams: make(map[string]*Stream),
 	}
 }
 

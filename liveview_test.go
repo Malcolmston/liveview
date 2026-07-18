@@ -445,8 +445,11 @@ func TestHandlerServesPage(t *testing.T) {
 	if !strings.Contains(body, "data-session=") {
 		t.Fatal("missing session id")
 	}
-	if !strings.Contains(body, "/counter/event") {
-		t.Fatal("client JS should target the event route")
+	if !strings.Contains(body, "new WebSocket") {
+		t.Fatal("client JS should open a WebSocket")
+	}
+	if !strings.Contains(body, "/counter") {
+		t.Fatal("client JS should target the handler prefix")
 	}
 }
 
