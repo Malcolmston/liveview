@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 )
 
 // wsGUID is the RFC 6455 "magic string" appended to the client's
@@ -64,12 +65,48 @@ func headerContainsToken(header, token string) bool {
 // Conn is a minimal RFC 6455 WebSocket connection built directly on a hijacked
 // net.Conn. It implements the framing needed by the liveview transport: reading
 // masked client frames, writing unmasked server frames, and answering ping and
-// close control frames. It is not safe for concurrent readers, nor for
-// concurrent writers; the runtime serializes writes through a single goroutine.
+// close control frames.
+//
+// Concurrency: writes are safe from multiple goroutines — [Conn.WriteText],
+// [Conn.WriteBinary] and [Conn.Ping] serialise against each other and against the
+// pong and close frames [Conn.ReadMessage] emits — and [Conn.Close] is safe to
+// call from any goroutine at any time, including while a read is in flight.
+// There must still be only ONE reader: [Conn.ReadMessage] owns the buffered
+// reader and two concurrent callers would interleave frames of different
+// messages.
+//
+// This previously documented writes as unsafe and relied on the caller funnelling
+// them through one goroutine. That was not a safe assumption to publish: Ping,
+// WriteText and Close all look independently callable, and ReadMessage itself
+// writes (a pong for every ping) from the reader goroutine, so even a caller with
+// a single writer had two. The race detector caught it as Close racing
+// ReadMessage on the closed flag.
 type Conn struct {
-	conn   net.Conn
-	br     *bufio.Reader
+	conn net.Conn
+	br   *bufio.Reader
+
+	// wmu serialises frame writes. A frame is emitted as two Write calls (header
+	// then payload), so without this two goroutines can interleave one frame's
+	// header with another's payload and desynchronise the stream for good. The
+	// API invites exactly that: Ping, WriteText and WriteBinary are all safe-
+	// looking methods a caller will reach for from different goroutines, and
+	// ReadMessage answers pings from the reader goroutine while the application
+	// writes from its own.
+	wmu sync.Mutex
+
+	// mu guards closed. Close is documented as idempotent, and ReadMessage closes
+	// the connection when the peer sends a close frame, so the flag is genuinely
+	// touched from two goroutines: the race detector caught Close() writing it
+	// while ReadMessage() -> writeClose() read it.
+	mu     sync.Mutex
 	closed bool
+}
+
+// isClosed reports whether the connection has been torn down.
+func (c *Conn) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
 }
 
 // Upgrade performs the server side of the RFC 6455 opening handshake on an
@@ -156,6 +193,10 @@ func (c *Conn) readFrame() (frame, error) {
 
 // writeFrame writes a single unmasked server frame with the FIN bit set.
 func (c *Conn) writeFrame(opcode byte, payload []byte) error {
+	// Held across BOTH writes below: the header and payload of one frame must
+	// reach the peer contiguously.
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
 	var hdr []byte
 	b0 := byte(0x80) | opcode // FIN + opcode
 	n := len(payload)
@@ -244,7 +285,7 @@ func (c *Conn) Ping(payload []byte) error {
 
 // writeClose sends a close control frame echoing the peer's status code.
 func (c *Conn) writeClose(payload []byte) error {
-	if c.closed {
+	if c.isClosed() {
 		return nil
 	}
 	return c.writeFrame(opClose, payload)
@@ -253,7 +294,7 @@ func (c *Conn) writeClose(payload []byte) error {
 // Close sends a normal (1000) close frame and tears down the connection. It is
 // idempotent.
 func (c *Conn) Close() error {
-	if c.closed {
+	if c.isClosed() {
 		return nil
 	}
 	_ = c.writeFrame(opClose, []byte{0x03, 0xE8}) // status 1000
@@ -261,9 +302,15 @@ func (c *Conn) Close() error {
 }
 
 func (c *Conn) closeConn() error {
+	// Check and set under one lock, so two goroutines racing to close cannot both
+	// see closed==false and call conn.Close() twice. The lock is released before
+	// conn.Close() so a blocking close cannot stall isClosed() callers.
+	c.mu.Lock()
 	if c.closed {
+		c.mu.Unlock()
 		return nil
 	}
 	c.closed = true
+	c.mu.Unlock()
 	return c.conn.Close()
 }

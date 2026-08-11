@@ -4,8 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -179,3 +182,127 @@ func (nopConn) RemoteAddr() net.Addr             { return nil }
 func (nopConn) SetDeadline(time.Time) error      { return nil }
 func (nopConn) SetReadDeadline(time.Time) error  { return nil }
 func (nopConn) SetWriteDeadline(time.Time) error { return nil }
+
+// tcpConnPair returns two connected TCP endpoints. net.Pipe is unsuitable here:
+// it is fully synchronous, so a Write blocks until the peer reads those exact
+// bytes, and a test with several concurrent writers and one reader deadlocks on
+// the pipe rather than on anything in Conn. A kernel-buffered socket is also what
+// production actually hands Conn (a hijacked HTTP connection).
+func tcpConnPair(t *testing.T) (server, client net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	type res struct {
+		c   net.Conn
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		c, err := ln.Accept()
+		ch <- res{c, err}
+	}()
+	client, err = net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	got := <-ch
+	if got.err != nil {
+		t.Fatalf("accept: %v", got.err)
+	}
+	t.Cleanup(func() { _ = got.c.Close(); _ = client.Close() })
+	return got.c, client
+}
+
+// TestConnConcurrentWritersAndClose pins the concurrency contract Conn now
+// documents. Under -race on the pre-fix code it fails two ways: writeFrame
+// emitted each frame as two unsynchronised conn.Write calls, so parallel writers
+// interleaved one frame's header with another's payload; and closed was a plain
+// bool that Close wrote while ReadMessage read it.
+//
+// The assertion is about the framing, not merely the absence of a race report: a
+// reader that parses every frame and counts every payload proves the writes did
+// not interleave, which is the corruption the write mutex exists to prevent.
+func TestConnConcurrentWritersAndClose(t *testing.T) {
+	a, b := tcpConnPair(t)
+	server := &Conn{conn: a, br: bufio.NewReader(a)}
+	client := &Conn{conn: b, br: bufio.NewReader(b)}
+
+	const (
+		writers = 8
+		each    = 25
+	)
+	// Differing lengths so a desynchronised reader cannot accidentally resync.
+	payloads := make([]string, writers)
+	for i := range payloads {
+		payloads[i] = strings.Repeat(string(rune('a'+i)), 40+i*7)
+	}
+
+	type result struct {
+		counts map[string]int
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		counts := make(map[string]int)
+		for i := 0; i < writers*each; i++ {
+			op, msg, err := client.ReadMessage()
+			if err != nil {
+				done <- result{counts, fmt.Errorf("after %d messages: %w", i, err)}
+				return
+			}
+			if op != opText {
+				done <- result{counts, fmt.Errorf("opcode = 0x%X, want text", op)}
+				return
+			}
+			counts[string(msg)]++
+		}
+		done <- result{counts, nil}
+	}()
+
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < each; i++ {
+				if err := server.WriteText(payloads[w]); err != nil {
+					t.Errorf("writer %d: %v", w, err)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("reader: %v (frame stream corrupted by interleaved writes?)", got.err)
+		}
+		for w, p := range payloads {
+			if got.counts[p] != each {
+				t.Errorf("payload %d: read %d copies, want %d", w, got.counts[p], each)
+			}
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("reader did not drain every frame within 30s")
+	}
+
+	// Close concurrently from several goroutines: it is documented idempotent, so
+	// exactly one teardown must happen and none may race.
+	var cwg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		cwg.Add(1)
+		go func() { defer cwg.Done(); _ = server.Close() }()
+	}
+	cwg.Wait()
+	if !server.isClosed() {
+		t.Error("server should be closed after Close()")
+	}
+	if err := server.Close(); err != nil {
+		t.Errorf("repeat Close() = %v, want nil (idempotent)", err)
+	}
+}
